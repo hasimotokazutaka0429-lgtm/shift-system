@@ -453,6 +453,63 @@ def get_previous_month(year, month):
 
 
 # ============================================================
+# 生成済みシフトの削除
+# ============================================================
+def delete_generated_shifts_for_month(year, month):
+    """指定した年月の生成済みシフトのみを削除する"""
+    connection = get_connection()
+    cursor = connection.cursor()
+    cursor.execute(
+        "DELETE FROM generated_shifts WHERE year = ? AND month = ?",
+        (year, month),
+    )
+    deleted_count = cursor.rowcount
+    connection.commit()
+    connection.close()
+    return deleted_count
+
+
+def delete_generated_shifts_from_month(year, month):
+    """指定した年月「以降」の生成済みシフトをすべて削除する"""
+    connection = get_connection()
+    cursor = connection.cursor()
+    cursor.execute(
+        """
+        DELETE FROM generated_shifts
+        WHERE (year > ?) OR (year = ? AND month >= ?)
+        """,
+        (year, year, month),
+    )
+    deleted_count = cursor.rowcount
+    connection.commit()
+    connection.close()
+    return deleted_count
+
+
+def delete_all_generated_shifts():
+    """生成済みシフトをすべて削除する"""
+    connection = get_connection()
+    cursor = connection.cursor()
+    cursor.execute("DELETE FROM generated_shifts")
+    deleted_count = cursor.rowcount
+    connection.commit()
+    connection.close()
+    return deleted_count
+
+
+def get_generated_shift_months():
+    """生成済みシフトが存在する年月の一覧を、古い順に返す"""
+    connection = get_connection()
+    cursor = connection.cursor()
+    cursor.execute(
+        "SELECT DISTINCT year, month FROM generated_shifts ORDER BY year, month"
+    )
+    rows = cursor.fetchall()
+    connection.close()
+    return [(row["year"], row["month"]) for row in rows]
+
+
+# ============================================================
 # 開始前（前月末）の勤務状態（前月データがない場合に使う手動設定）
 # ============================================================
 def get_initial_carryover_setting(employee_id):
@@ -1126,150 +1183,50 @@ elif menu == "個人勤務条件":
     st.header("個人ごとの勤務回数条件")
 
     employees = get_employees()
-
     if len(employees) == 0:
         st.info("先に社員を登録してください。")
-
     else:
-        employee_names = {
-            employee["name"]: employee
-            for employee in employees
-        }
-
-        selected_name = st.selectbox(
-            "社員",
-            list(employee_names.keys())
-        )
-
+        employee_names = {employee["name"]: employee for employee in employees}
+        selected_name = st.selectbox("社員", list(employee_names.keys()))
         employee = employee_names[selected_name]
 
-        # ----------------------------------------------------
-        # 保存されている勤務条件を取得
-        # ----------------------------------------------------
         limits = get_shift_limits(employee["id"])
+        limit_dictionary = {limit["shift_type"]: (limit["min_count"], limit["max_count"]) for limit in limits}
 
-        limit_dictionary = {
-            limit["shift_type"]: (
-                limit["min_count"],
-                limit["max_count"]
-            )
-            for limit in limits
-        }
-
-        shift_limit_types = [
-            "日勤",
-            "リーダー",
-            "半日",
-            "準夜"
-        ]
-
-        # ====================================================
-        # 現在保存されている条件を表示
-        # ====================================================
-        st.subheader("現在の勤務条件")
-
-        condition_rows = []
-
-        for shift_type in shift_limit_types:
-            minimum, maximum = limit_dictionary.get(
-                shift_type,
-                (0, 31)
-            )
-
-            condition_rows.append({
-                "勤務種類": shift_type,
-                "最低回数": minimum,
-                "最大回数": maximum
-            })
-
-        condition_dataframe = pd.DataFrame(condition_rows)
-
-        st.dataframe(
-            condition_dataframe,
-            use_container_width=True,
-            hide_index=True
-        )
-
-        st.divider()
-
-        # ====================================================
-        # 条件編集
-        # ====================================================
-        st.subheader("勤務条件を変更")
+        shift_limit_types = ["日勤", "リーダー", "半日", "準夜"]
 
         with st.form("shift_limits_form"):
-
             values = {}
-
             for shift_type in shift_limit_types:
-
-                current = limit_dictionary.get(
-                    shift_type,
-                    (0, 31)
-                )
-
+                current = limit_dictionary.get(shift_type, (0, 31))
                 col1, col2 = st.columns(2)
-
                 with col1:
                     minimum = st.number_input(
-                        f"{shift_type} 最低回数",
-                        min_value=0,
-                        max_value=31,
-                        value=int(current[0]),
+                        f"{shift_type} 最低回数", min_value=0, max_value=31, value=current[0],
                         key=f"min_{employee['id']}_{shift_type}",
                     )
-
                 with col2:
                     maximum = st.number_input(
-                        f"{shift_type} 最大回数",
-                        min_value=0,
-                        max_value=31,
-                        value=int(current[1]),
+                        f"{shift_type} 最大回数", min_value=0, max_value=31, value=current[1],
                         key=f"max_{employee['id']}_{shift_type}",
                     )
-
-                values[shift_type] = (
-                    minimum,
-                    maximum
-                )
+                values[shift_type] = (minimum, maximum)
 
             submitted = st.form_submit_button("保存")
-
             if submitted:
-
                 has_error = False
-
                 for shift_type, value in values.items():
-
                     minimum, maximum = value
-
                     if minimum > maximum:
-
-                        st.error(
-                            f"{shift_type}の最低回数が最大回数を超えています。"
-                        )
-
+                        st.error(f"{shift_type}の最低回数が最大回数を超えています。")
                         has_error = True
 
                 if not has_error:
-
                     for shift_type, value in values.items():
-
                         minimum, maximum = value
+                        save_shift_limit(employee["id"], shift_type, minimum, maximum)
+                    st.success("勤務条件を保存しました。")
 
-                        save_shift_limit(
-                            employee["id"],
-                            shift_type,
-                            minimum,
-                            maximum
-                        )
-
-                    st.success(
-                        "勤務条件を保存しました。"
-                    )
-
-                    # 保存後に画面を更新
-                    st.rerun()
 # ============================================================
 # 希望入力
 # ============================================================
@@ -1575,3 +1532,98 @@ elif menu == "データのバックアップ":
         "- Supabase・Neon・Turso などの外部データベースサービスを別途用意し、"
         "そちらにデータを保存するよう改修する"
     )
+
+    st.divider()
+    st.subheader("生成済みシフトの削除")
+    st.write(
+        "生成済みシフトを削除します。社員情報・希望・各種条件は削除されません。\n\n"
+        "生成済みシフトは、月またぎの準夜→深夜の継続判定にも使われています。"
+        "削除すると、その月について「前月データなし」として扱われるようになる"
+        "（＝社員管理で設定した「開始前の勤務状態」、または継続なしの扱いに戻る）点にご注意ください。"
+    )
+
+    existing_months = get_generated_shift_months()
+    if existing_months:
+        month_labels = [f"{year}年{month}月" for year, month in existing_months]
+        st.caption("生成済みシフトがある年月：" + " / ".join(month_labels))
+    else:
+        st.info("現在、生成済みシフトはありません。")
+
+    col1, col2 = st.columns(2)
+    with col1:
+        delete_target_year = st.number_input(
+            "対象年", min_value=2020, max_value=2100, value=2026, key="delete_shift_year"
+        )
+    with col2:
+        delete_target_month = st.number_input(
+            "対象月", min_value=1, max_value=12, value=9, key="delete_shift_month"
+        )
+
+    st.write("① 指定した月のシフトを削除")
+    if st.button(
+        f"{delete_target_year}年{delete_target_month}月のシフトを削除する",
+        key="delete_month_button",
+    ):
+        st.session_state["confirm_delete_month"] = True
+    if st.session_state.get("confirm_delete_month"):
+        st.warning(
+            f"{delete_target_year}年{delete_target_month}月の生成済みシフトを削除します。"
+            f"この操作は取り消せません。"
+        )
+        confirm_col1, confirm_col2 = st.columns(2)
+        with confirm_col1:
+            if st.button("削除を実行する", key="confirm_delete_month_button", type="primary"):
+                deleted_count = delete_generated_shifts_for_month(delete_target_year, delete_target_month)
+                st.session_state["confirm_delete_month"] = False
+                st.success(f"{delete_target_year}年{delete_target_month}月のシフト（{deleted_count}件）を削除しました。")
+                st.rerun()
+        with confirm_col2:
+            if st.button("キャンセル", key="cancel_delete_month_button"):
+                st.session_state["confirm_delete_month"] = False
+                st.rerun()
+
+    st.divider()
+
+    st.write("② 指定した月以降のシフトをまとめて削除")
+    if st.button(
+        f"{delete_target_year}年{delete_target_month}月以降のシフトを削除する",
+        key="delete_from_month_button",
+    ):
+        st.session_state["confirm_delete_from_month"] = True
+    if st.session_state.get("confirm_delete_from_month"):
+        st.warning(
+            f"{delete_target_year}年{delete_target_month}月、およびそれ以降に生成された"
+            f"シフトをすべて削除します。この操作は取り消せません。"
+        )
+        confirm_col1, confirm_col2 = st.columns(2)
+        with confirm_col1:
+            if st.button("削除を実行する", key="confirm_delete_from_month_button", type="primary"):
+                deleted_count = delete_generated_shifts_from_month(delete_target_year, delete_target_month)
+                st.session_state["confirm_delete_from_month"] = False
+                st.success(
+                    f"{delete_target_year}年{delete_target_month}月以降のシフト（{deleted_count}件）を削除しました。"
+                )
+                st.rerun()
+        with confirm_col2:
+            if st.button("キャンセル", key="cancel_delete_from_month_button"):
+                st.session_state["confirm_delete_from_month"] = False
+                st.rerun()
+
+    st.divider()
+
+    st.write("③ すべての生成済みシフトを削除")
+    if st.button("すべての生成済みシフトを削除する", key="delete_all_button"):
+        st.session_state["confirm_delete_all"] = True
+    if st.session_state.get("confirm_delete_all"):
+        st.warning("生成済みのシフトを全期間分削除します。この操作は取り消せません。")
+        confirm_col1, confirm_col2 = st.columns(2)
+        with confirm_col1:
+            if st.button("削除を実行する", key="confirm_delete_all_button", type="primary"):
+                deleted_count = delete_all_generated_shifts()
+                st.session_state["confirm_delete_all"] = False
+                st.success(f"すべての生成済みシフト（{deleted_count}件）を削除しました。")
+                st.rerun()
+        with confirm_col2:
+            if st.button("キャンセル", key="cancel_delete_all_button"):
+                st.session_state["confirm_delete_all"] = False
+                st.rerun()
