@@ -1315,7 +1315,7 @@ elif menu == "希望休・希望勤務":
 
         dataframe = pd.DataFrame(rows)
 
-        st.write("記号：― 指定なし / 公 公休 / 有 有休 / 日 日勤 / L リーダー / 半 半日 / 準 準夜 / 深 深夜")
+        st.write("記号：無 指定なし / 公 公休 / 有 有休 / ー 日勤 / R リーダー / 半 半日 / △ 準夜 / 〇 深夜")
 
         column_config = {"社員名": st.column_config.TextColumn("社員名", disabled=True, width="medium")}
         for column in dataframe.columns[1:]:
