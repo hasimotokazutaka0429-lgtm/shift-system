@@ -136,10 +136,16 @@ def init_database():
             group_name TEXT,
             shift_type TEXT,
             required_count INTEGER DEFAULT 0,
+            max_count INTEGER DEFAULT NULL,
             UNIQUE(condition_type, group_name, shift_type)
         )
         """
     )
+    # 既存DB向けの簡易マイグレーション（max_countカラムが無い場合のみ追加する）
+    try:
+        cursor.execute("ALTER TABLE staffing_conditions ADD COLUMN max_count INTEGER DEFAULT NULL")
+    except sqlite3.OperationalError:
+        pass
 
     cursor.execute(
         """
@@ -330,17 +336,17 @@ def get_staffing_conditions():
     return conditions
 
 
-def save_staffing_condition(condition_type, group_name, shift_type, required_count):
+def save_staffing_condition(condition_type, group_name, shift_type, required_count, max_count=None):
     connection = get_connection()
     cursor = connection.cursor()
     cursor.execute(
         """
-        INSERT INTO staffing_conditions (condition_type, group_name, shift_type, required_count)
-        VALUES (?, ?, ?, ?)
+        INSERT INTO staffing_conditions (condition_type, group_name, shift_type, required_count, max_count)
+        VALUES (?, ?, ?, ?, ?)
         ON CONFLICT(condition_type, group_name, shift_type)
-        DO UPDATE SET required_count = excluded.required_count
+        DO UPDATE SET required_count = excluded.required_count, max_count = excluded.max_count
         """,
-        (condition_type, group_name, shift_type, required_count),
+        (condition_type, group_name, shift_type, required_count, max_count),
     )
     connection.commit()
     connection.close()
@@ -399,6 +405,18 @@ def create_condition_dictionary():
     for condition in conditions:
         key = (condition["condition_type"], condition["group_name"], condition["shift_type"])
         result[key] = condition["required_count"]
+    return result
+
+
+def create_condition_max_dictionary():
+    """人数条件の上限値の辞書。上限が設定されていない組み合わせはキーに含まれない"""
+    conditions = get_staffing_conditions()
+    result = {}
+    for condition in conditions:
+        if condition["max_count"] is None:
+            continue
+        key = (condition["condition_type"], condition["group_name"], condition["shift_type"])
+        result[key] = condition["max_count"]
     return result
 
 
@@ -603,6 +621,7 @@ def check_generation_conditions(employees, year, month):
     problems = []
     days_in_month = calendar.monthrange(year, month)[1]
     conditions = create_condition_dictionary()
+    max_conditions = create_condition_max_dictionary()
     experience_conditions = create_experience_dictionary()
 
     if len(employees) == 0:
@@ -620,6 +639,17 @@ def check_generation_conditions(employees, year, month):
                 problems.append(
                     f"{employee['name']}さんの{limit['shift_type']}について、"
                     f"最低回数が最大回数を超えています。"
+                )
+
+    # ★追加: リーダー人数の上限に関する矛盾チェック（曜日タイプごとに1回）
+    for day_type in ["通常", "水曜", "土曜", "日祝"]:
+        for group_name in ["A", "B", "全体"]:
+            required_leader = conditions.get((day_type, group_name, "リーダー"), 0)
+            max_leader = max_conditions.get((day_type, group_name, "リーダー"))
+            if max_leader is not None and required_leader > max_leader:
+                problems.append(
+                    f"{day_type}のグループ{group_name}で、"
+                    f"リーダーの最低必要人数（{required_leader}人）が上限（{max_leader}人）を超えています。"
                 )
 
     for day in range(1, days_in_month + 1):
@@ -868,7 +898,7 @@ def generate_shift(employees, year, month):
         limits = get_shift_limits(employee["id"])
         limit_dictionary = {limit["shift_type"]: (limit["min_count"], limit["max_count"]) for limit in limits}
 
-        shift_code = {"日勤": DAY, "リーダー": LEADER, "半日": HALF, "準夜": EVENING,"公休": OFF}
+        shift_code = {"日勤": DAY, "リーダー": LEADER, "半日": HALF, "準夜": EVENING}
         for shift_name, code in shift_code.items():
             if shift_name not in limit_dictionary:
                 continue
@@ -907,6 +937,7 @@ def generate_shift(employees, year, month):
     # 人数条件
     # ========================================================
     conditions = create_condition_dictionary()
+    max_conditions = create_condition_max_dictionary()
     for d in range(days_in_month):
         day_number = d + 1
         condition_type = get_day_type(year, month, day_number)
@@ -930,6 +961,16 @@ def generate_shift(employees, year, month):
                 )
                 model.Add(
                     sum(shifts[i, d, LEADER] for i in group_employees) >= required_leader
+                ).OnlyEnforceIf(indicator)
+
+            # ★追加: リーダー人数の上限
+            max_leader = max_conditions.get((condition_type, group_name, "リーダー"))
+            if max_leader is not None:
+                indicator = add_assumption(
+                    f"{day_number}日（{condition_type}）のグループ{group_name}のリーダー人数の上限（{max_leader}人以下）"
+                )
+                model.Add(
+                    sum(shifts[i, d, LEADER] for i in group_employees) <= max_leader
                 ).OnlyEnforceIf(indicator)
 
             required_half = conditions.get((condition_type, group_name, "半日"), 0)
@@ -1193,7 +1234,7 @@ elif menu == "個人勤務条件":
         limits = get_shift_limits(employee["id"])
         limit_dictionary = {limit["shift_type"]: (limit["min_count"], limit["max_count"]) for limit in limits}
 
-        shift_limit_types = ["日勤", "リーダー", "半日", "準夜","公休"]
+        shift_limit_types = ["日勤", "リーダー", "半日", "準夜"]
 
         with st.form("shift_limits_form"):
             values = {}
@@ -1308,6 +1349,7 @@ elif menu == "人数条件":
     # 通常の人数条件
     # ========================================================
     st.subheader("勤務人数条件")
+    existing_max_conditions = create_condition_max_dictionary()
     for condition_type in condition_types:
         with st.expander(f"{condition_type}の条件", expanded=False):
             for group_name in groups:
@@ -1323,9 +1365,32 @@ elif menu == "人数条件":
                             key=f"{condition_type}_{group_name}_{shift_type}",
                         )
 
+                # ★追加: リーダー人数の上限（1日あたり）
+                leader_key = (condition_type, group_name, "リーダー")
+                existing_leader_max = existing_max_conditions.get(leader_key)
+                leader_max_col1, leader_max_col2 = st.columns([1, 2])
+                with leader_max_col1:
+                    leader_max_enabled = st.checkbox(
+                        "リーダー人数の上限を設定する",
+                        value=existing_leader_max is not None,
+                        key=f"leader_max_enabled_{condition_type}_{group_name}",
+                    )
+                with leader_max_col2:
+                    leader_max_value = st.number_input(
+                        "1日あたりのリーダー上限人数",
+                        min_value=0, max_value=100,
+                        value=existing_leader_max if existing_leader_max is not None else max(1, values["リーダー"]),
+                        key=f"leader_max_value_{condition_type}_{group_name}",
+                        disabled=not leader_max_enabled,
+                    )
+
                 if st.button(f"{condition_type} グループ{group_name} 保存", key=f"save_{condition_type}_{group_name}"):
+                    leader_max_to_save = leader_max_value if leader_max_enabled else None
                     for shift_type, value in values.items():
-                        save_staffing_condition(condition_type, group_name, shift_type, value)
+                        if shift_type == "リーダー":
+                            save_staffing_condition(condition_type, group_name, shift_type, value, leader_max_to_save)
+                        else:
+                            save_staffing_condition(condition_type, group_name, shift_type, value)
                     st.success("保存しました。")
 
     # ========================================================
