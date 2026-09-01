@@ -51,7 +51,7 @@ SHIFT_SHORT_NAMES = {
     "公休": "公",
     "有休": "有",
     "日勤": "日",
-    "リーダー": "R",
+    "リーダー": "L",
     "半日": "半",
     "準夜": "準",
     "深夜": "深",
@@ -1540,11 +1540,20 @@ elif menu == "シフト生成":
                         weekday = calendar.weekday(selected_year, selected_month, day)
                         columns.append(f"{day}({weekday_names[weekday]})")
 
-                    dataframe = pd.DataFrame(result).T
+                    # ★修正: 結果表示はSHIFT_SHORT_NAMESの短縮表記で行う
+                    # （generated_shifts等に保存されている result 自体はフルネームのまま変更しない）
+                    display_result = {
+                        name: [SHIFT_SHORT_NAMES.get(shift, shift) for shift in shift_list]
+                        for name, shift_list in result.items()
+                    }
+
+                    st.write("記号：公 公休 / 有 有休 / 日 日勤 / L リーダー / 半 半日 / 準 準夜 / 深 深夜")
+
+                    dataframe = pd.DataFrame(display_result).T
                     dataframe.columns = columns
                     st.dataframe(dataframe, use_container_width=True)
 
-                    excel_data = create_excel(result, selected_year, selected_month)
+                    excel_data = create_excel(display_result, selected_year, selected_month)
                     st.download_button(
                         "Excelをダウンロード",
                         data=excel_data,
