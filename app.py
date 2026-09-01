@@ -868,7 +868,7 @@ def generate_shift(employees, year, month):
         limits = get_shift_limits(employee["id"])
         limit_dictionary = {limit["shift_type"]: (limit["min_count"], limit["max_count"]) for limit in limits}
 
-        shift_code = {"日勤": DAY, "リーダー": LEADER, "半日": HALF, "準夜": EVENING}
+        shift_code = {"日勤": DAY, "リーダー": LEADER, "半日": HALF, "準夜": EVENING,"公休": OFF}
         for shift_name, code in shift_code.items():
             if shift_name not in limit_dictionary:
                 continue
@@ -1193,7 +1193,7 @@ elif menu == "個人勤務条件":
         limits = get_shift_limits(employee["id"])
         limit_dictionary = {limit["shift_type"]: (limit["min_count"], limit["max_count"]) for limit in limits}
 
-        shift_limit_types = ["日勤", "リーダー", "半日", "準夜"]
+        shift_limit_types = ["日勤", "リーダー", "半日", "準夜","公休"]
 
         with st.form("shift_limits_form"):
             values = {}
