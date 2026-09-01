@@ -1,6 +1,8 @@
 import streamlit as st
 import sqlite3
 import calendar
+import os
+import shutil
 from datetime import date
 from io import BytesIO
 import pandas as pd
@@ -12,7 +14,16 @@ from ortools.sat.python import cp_model
 # ============================================================
 st.set_page_config(page_title="シフト生成システム", layout="wide")
 
-DATABASE_NAME = "shift_system.db"
+# ------------------------------------------------------------
+# DBファイルの場所。
+# 環境変数 SHIFT_DB_PATH が設定されていれば、そちらを使う
+# （自前サーバーやDockerで永続ボリュームをマウントしている場合に指定する）。
+# 未設定の場合はアプリと同じ場所の shift_system.db を使う
+# （Streamlit Community Cloud等、リポジトリからデプロイする環境では
+#   再デプロイのたびに消えるため、下の「データのバックアップ」メニューから
+#   こまめにバックアップ/復元してください）。
+# ------------------------------------------------------------
+DATABASE_NAME = os.environ.get("SHIFT_DB_PATH", "shift_system.db")
 
 # ============================================================
 # 勤務コード
@@ -143,6 +154,40 @@ def init_database():
         """
     )
 
+    # --------------------------------------------------------
+    # 生成済みシフト（月またぎで準夜→深夜の継続を判定するために保存する）
+    # --------------------------------------------------------
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS generated_shifts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            employee_id INTEGER,
+            year INTEGER,
+            month INTEGER,
+            day INTEGER,
+            shift_type TEXT,
+            UNIQUE(employee_id, year, month, day)
+        )
+        """
+    )
+
+    # --------------------------------------------------------
+    # 開始前（前月末）の勤務状態
+    #
+    # システムで初めてシフトを生成する月や、前月分を生成していない月では
+    # generated_shifts に前月末のデータがない。その場合に使う、
+    # 社員ごとの手動設定（「準夜」なら1日目は深夜が確定、
+    # 「深夜」なら1日目は公休が確定）。
+    # --------------------------------------------------------
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS initial_carryover_settings (
+            employee_id INTEGER PRIMARY KEY,
+            last_shift_type TEXT
+        )
+        """
+    )
+
     connection.commit()
     connection.close()
 
@@ -170,8 +215,10 @@ def add_employee(name, employment_type, gender, experience_years, group_name, ca
         """,
         (name, employment_type, gender, experience_years, group_name, int(can_leader), max_consecutive_days),
     )
+    new_employee_id = cursor.lastrowid
     connection.commit()
     connection.close()
+    return new_employee_id
 
 
 def update_employee(employee_id, name, employment_type, gender, experience_years, group_name, can_leader, max_consecutive_days):
@@ -195,6 +242,7 @@ def delete_employee(employee_id):
     cursor = connection.cursor()
     cursor.execute("DELETE FROM employee_shift_limits WHERE employee_id = ?", (employee_id,))
     cursor.execute("DELETE FROM requests WHERE employee_id = ?", (employee_id,))
+    cursor.execute("DELETE FROM initial_carryover_settings WHERE employee_id = ?", (employee_id,))
     cursor.execute("DELETE FROM employees WHERE id = ?", (employee_id,))
     connection.commit()
     connection.close()
@@ -370,6 +418,128 @@ def get_group_employee_indexes(employees, group_name):
 
 
 # ============================================================
+# 生成済みシフトの保存・取得（月またぎの準夜→深夜継続に使用）
+# ============================================================
+def save_generated_shifts(employees, year, month, result, days_in_month):
+    connection = get_connection()
+    cursor = connection.cursor()
+    cursor.execute(
+        "DELETE FROM generated_shifts WHERE year = ? AND month = ?",
+        (year, month),
+    )
+    for employee in employees:
+        name = employee["name"]
+        if name not in result:
+            continue
+        for day_index, shift_name in enumerate(result[name]):
+            if day_index >= days_in_month:
+                break
+            day = day_index + 1
+            cursor.execute(
+                """
+                INSERT INTO generated_shifts (employee_id, year, month, day, shift_type)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (employee["id"], year, month, day, shift_name),
+            )
+    connection.commit()
+    connection.close()
+
+
+def get_previous_month(year, month):
+    if month == 1:
+        return year - 1, 12
+    return year, month - 1
+
+
+# ============================================================
+# 開始前（前月末）の勤務状態（前月データがない場合に使う手動設定）
+# ============================================================
+def get_initial_carryover_setting(employee_id):
+    connection = get_connection()
+    cursor = connection.cursor()
+    cursor.execute(
+        "SELECT last_shift_type FROM initial_carryover_settings WHERE employee_id = ?",
+        (employee_id,),
+    )
+    row = cursor.fetchone()
+    connection.close()
+    return row["last_shift_type"] if row else None
+
+
+def save_initial_carryover_setting(employee_id, last_shift_type):
+    """last_shift_type は '準夜' / '深夜' / None（指定なし）のいずれか"""
+    connection = get_connection()
+    cursor = connection.cursor()
+    cursor.execute(
+        """
+        INSERT INTO initial_carryover_settings (employee_id, last_shift_type)
+        VALUES (?, ?)
+        ON CONFLICT(employee_id) DO UPDATE SET last_shift_type = excluded.last_shift_type
+        """,
+        (employee_id, last_shift_type),
+    )
+    connection.commit()
+    connection.close()
+
+
+def has_month_shift_data(year, month):
+    connection = get_connection()
+    cursor = connection.cursor()
+    cursor.execute(
+        "SELECT COUNT(*) AS count FROM generated_shifts WHERE year = ? AND month = ?",
+        (year, month),
+    )
+    row = cursor.fetchone()
+    connection.close()
+    return row["count"] > 0
+
+
+def get_last_day_shift(employee_id, year, month):
+    """指定した年月の、社員の最終日の確定シフトを取得する（無ければNone）"""
+    connection = get_connection()
+    cursor = connection.cursor()
+    days_in_month = calendar.monthrange(year, month)[1]
+    cursor.execute(
+        """
+        SELECT shift_type FROM generated_shifts
+        WHERE employee_id = ? AND year = ? AND month = ? AND day = ?
+        """,
+        (employee_id, year, month, days_in_month),
+    )
+    row = cursor.fetchone()
+    connection.close()
+    return row["shift_type"] if row else None
+
+
+def get_carryover_map(employees, year, month):
+    """
+    前月末のシフトから、当月1日に確定させるべきシフトを判定する。
+      前月末が「準夜」 → 当月1日は「深夜」が確定（"NIGHT"）
+      前月末が「深夜」 → 当月1日は「公休」が確定（"OFF"）
+      それ以外／前月のデータがない → 継続なし（None）
+
+    前月分がシステムでまだ生成されていない場合（初めて使う月など）は、
+    社員ごとに手動設定した「開始前（前月末）の勤務状態」を代わりに使う。
+
+    戻り値: { employee_id: "NIGHT" | "OFF" | None }
+    """
+    prev_year, prev_month = get_previous_month(year, month)
+    carryover = {}
+    for employee in employees:
+        last_shift = get_last_day_shift(employee["id"], prev_year, prev_month)
+        if last_shift is None:
+            last_shift = get_initial_carryover_setting(employee["id"])
+        if last_shift == "準夜":
+            carryover[employee["id"]] = "NIGHT"
+        elif last_shift == "深夜":
+            carryover[employee["id"]] = "OFF"
+        else:
+            carryover[employee["id"]] = None
+    return carryover
+
+
+# ============================================================
 # シフト生成前の条件チェック
 # ============================================================
 def check_generation_conditions(employees, year, month):
@@ -381,6 +551,9 @@ def check_generation_conditions(employees, year, month):
     if len(employees) == 0:
         problems.append("社員が1人も登録されていません。")
         return problems
+
+    # 前月末が準夜／深夜だった社員は、当月1日のシフトが確定する
+    carryover = get_carryover_map(employees, year, month)
 
     # 個人条件 min > max
     for employee in employees:
@@ -430,26 +603,29 @@ def check_generation_conditions(employees, year, month):
                 )
 
             # 準夜
+            # ★修正: 月末の準夜は翌月1日の深夜として引き継がれるため、以前あった
+            # 「月末には準夜を設定できない」という制限は撤廃した。
             required_evening = conditions.get((day_type, group_name, "準夜"), 0)
-            if required_evening > 0 and day >= days_in_month:
-                problems.append(
-                    f"{day}日（{day_type}）に準夜{required_evening}人が必要ですが、"
-                    f"準夜は翌日の深夜勤務が必要なため、月末には設定できません。"
-                )
 
             # 深夜
+            # ★修正: 月末の深夜は翌月1日の公休として引き継がれるため、以前あった
+            # 「月末には深夜を設定できない」という制限は撤廃した。
             required_night = conditions.get((day_type, group_name, "深夜"), 0)
-            if required_night > 0 and day >= days_in_month:
-                problems.append(
-                    f"{day}日（{day_type}）に深夜{required_night}人が必要ですが、"
-                    f"深夜の翌日は公休が必要なため、月末には設定できません。"
-                )
-            # ★修正: 1日目は前日の準夜が存在しないため深夜は不可能（従来ここが未チェックだった）
+
+            # ★修正: 1日目に深夜を割り当てられるのは、前月末が準夜だった社員だけ
+            # （それ以外の社員は1日目に深夜になることは絶対にない）。
+            # そのため、1日目の深夜人数条件は「前月末に準夜だった社員の人数」と
+            # 正確に比較できる。
             if required_night > 0 and day == 1:
-                problems.append(
-                    f"1日（{day_type}）に深夜{required_night}人の条件が設定されていますが、"
-                    f"前日の準夜勤務が存在しないため、1日に深夜勤務を割り当てることはできません。"
+                forced_night_count = sum(
+                    1 for index in indexes if carryover.get(employees[index]["id"]) == "NIGHT"
                 )
+                if required_night > forced_night_count:
+                    problems.append(
+                        f"1日（{day_type}）のグループ{group_name}で深夜{required_night}人が必要ですが、"
+                        f"前月末に準夜勤務だった（＝1日に深夜が確定している）社員は"
+                        f"{forced_night_count}人しかいません。"
+                    )
 
             # 経験年数
             for key in list(experience_conditions.keys()):
@@ -469,6 +645,7 @@ def check_generation_conditions(employees, year, month):
     for employee in employees:
         requests = get_requests(employee["id"], year, month)
         request_dictionary = {request["day"]: request["request_type"] for request in requests}
+        forced_day1 = carryover.get(employee["id"])
 
         for day, request_type in request_dictionary.items():
             if request_type == "半日":
@@ -477,20 +654,29 @@ def check_generation_conditions(employees, year, month):
                     problems.append(
                         f"{employee['name']}さんの{day}日の半日希望は、水曜・土曜以外なので設定できません。"
                     )
-            if request_type == "準夜":
-                if day >= days_in_month:
+            # ★修正: 準夜・深夜とも、月末は翌月へ引き継がれるため希望として設定可能になった
+            if request_type == "深夜" and day == 1:
+                # 1日目の深夜が許されるのは、前月末が準夜で確定している社員だけ
+                if forced_day1 != "NIGHT":
                     problems.append(
-                        f"{employee['name']}さんの{day}日の準夜希望は、翌日の深夜勤務が必要なため設定できません。"
+                        f"{employee['name']}さんの1日の深夜希望は、前月末が準夜勤務で確定していないため設定できません"
+                        f"（前月のシフトを先に生成するか、社員管理画面で「開始前（前月末）の勤務状態」を"
+                        f"「準夜」に設定してください）。"
                     )
-            if request_type == "深夜":
-                if day >= days_in_month:
-                    problems.append(
-                        f"{employee['name']}さんの{day}日の深夜希望は、翌日公休が必要なため設定できません。"
-                    )
-                if day == 1:
-                    problems.append(
-                        f"{employee['name']}さんの1日の深夜希望は、前日の準夜勤務が必要なため設定できません。"
-                    )
+
+        # ★追加: 前月末からの継続で当月1日のシフトが確定している場合、
+        # その日に別のシフトが希望されていないか確認する
+        day1_request = request_dictionary.get(1)
+        if forced_day1 == "NIGHT" and day1_request is not None and day1_request != "深夜":
+            problems.append(
+                f"{employee['name']}さんは前月末が準夜勤務のため、1日は深夜勤務が確定していますが、"
+                f"1日に別の希望（{day1_request}）が設定されています。希望を「深夜」に変更するか、削除してください。"
+            )
+        if forced_day1 == "OFF" and day1_request is not None and day1_request != "公休":
+            problems.append(
+                f"{employee['name']}さんは前月末が深夜勤務のため、1日は公休が確定していますが、"
+                f"1日に別の希望（{day1_request}）が設定されています。希望を「公休」に変更するか、削除してください。"
+            )
 
     return problems
 
@@ -540,28 +726,8 @@ def generate_shift(employees, year, month):
             for d in range(days_in_month):
                 model.Add(shifts[e, d, LEADER] == 0)
 
-    # ========================================================
-    # 準夜 → 深夜 → 公休（構造上のハード制約）
-    # ========================================================
-    for e in range(employee_count):
-        for d in range(days_in_month):
-            if d + 1 >= days_in_month:
-                model.Add(shifts[e, d, EVENING] == 0)
-            else:
-                model.Add(shifts[e, d, EVENING] == shifts[e, d + 1, NIGHT])
-
-            if d == 0:
-                model.Add(shifts[e, d, NIGHT] == 0)
-            else:
-                model.Add(shifts[e, d, NIGHT] == shifts[e, d - 1, EVENING])
-
-            if d + 1 < days_in_month:
-                model.AddImplication(shifts[e, d, NIGHT], shifts[e, d + 1, OFF])
-            else:
-                model.Add(shifts[e, d, NIGHT] == 0)
-
     # --------------------------------------------------------
-    # ここから先は「ユーザーが設定した条件」。
+    # ここから先は「ユーザーが設定した条件（前月末からの継続を含む）」。
     # 矛盾の原因を特定できるよう、それぞれに assumption（目印）を付けて
     # OnlyEnforceIf で紐付ける。
     # --------------------------------------------------------
@@ -573,6 +739,54 @@ def generate_shift(employees, year, month):
         assumption_literals.append(indicator)
         assumption_descriptions[indicator.Index()] = description
         return indicator
+
+    # ========================================================
+    # 準夜 → 深夜 → 公休（月またぎ対応）
+    #
+    # 月の途中の連結（準夜の翌日は深夜、深夜の翌日は公休）は
+    # 構造上のハード制約。
+    # 月末の準夜／深夜は「翌月の生成時」に引き継がれるので、ここでは
+    # 禁止しない（EVENING/NIGHTを0に固定しない）。
+    # 月初(1日目)は、前月末のシフト（carryover）によって深夜が
+    # 確定する場合があるので、その場合は assumption 付きで固定する。
+    # ========================================================
+    carryover = get_carryover_map(employees, year, month)
+
+    for e, employee in enumerate(employees):
+        forced_day1 = carryover.get(employee["id"])
+
+        for d in range(days_in_month):
+            # 準夜の翌日は深夜（月内のみ。月末は翌月へ引き継ぐため制約しない）
+            if d + 1 < days_in_month:
+                model.Add(shifts[e, d, EVENING] == shifts[e, d + 1, NIGHT])
+
+            # 深夜は前日が準夜のときのみ
+            if d == 0:
+                if forced_day1 == "NIGHT":
+                    # 前月末が準夜だったので、1日は深夜が確定
+                    indicator = add_assumption(
+                        f"{employee['name']}さんの1日は深夜勤務"
+                        f"（前月末の準夜勤務からの継続）"
+                    )
+                    model.Add(shifts[e, d, NIGHT] == 1).OnlyEnforceIf(indicator)
+                elif forced_day1 == "OFF":
+                    # 前月末が深夜だったので、1日は公休が確定（深夜は当然0）
+                    indicator = add_assumption(
+                        f"{employee['name']}さんの1日は公休"
+                        f"（前月末の深夜勤務の翌日のため）"
+                    )
+                    model.Add(shifts[e, d, OFF] == 1).OnlyEnforceIf(indicator)
+                    model.Add(shifts[e, d, NIGHT] == 0)
+                else:
+                    # 前月のデータがない場合、1日目に深夜は割り当てられない
+                    # （前日=前月末の勤務が不明なため。構造上のハード制約）
+                    model.Add(shifts[e, d, NIGHT] == 0)
+            else:
+                model.Add(shifts[e, d, NIGHT] == shifts[e, d - 1, EVENING])
+
+            # 深夜の翌日は公休（月内のみ。月末の深夜は翌月の生成時に公休が確定する）
+            if d + 1 < days_in_month:
+                model.AddImplication(shifts[e, d, NIGHT], shifts[e, d + 1, OFF])
 
     # ========================================================
     # 希望条件
@@ -738,6 +952,8 @@ def generate_shift(employees, year, month):
                     if solver.Value(shifts[e, d, s]) == 1:
                         result[employee["name"]].append(SHIFT_NAMES[s])
                         break
+        # 翌月生成時の「準夜→深夜」「深夜→公休」継続判定に使うため保存する
+        save_generated_shifts(employees, year, month, result, days_in_month)
         return result, []
 
     if status == cp_model.INFEASIBLE:
@@ -792,7 +1008,7 @@ st.title("シフト自動生成システム")
 # ============================================================
 menu = st.sidebar.radio(
     "メニュー",
-    ["社員管理", "個人勤務条件", "希望休・希望勤務", "人数条件", "シフト生成"],
+    ["社員管理", "個人勤務条件", "希望休・希望勤務", "人数条件", "シフト生成", "データのバックアップ"],
 )
 
 # ============================================================
@@ -815,12 +1031,25 @@ if menu == "社員管理":
         can_leader = st.checkbox("リーダー可能")
         max_consecutive_days = st.number_input("最大連勤日数", min_value=1, max_value=31, value=5)
 
+        st.write("開始前（前月末）の勤務状態")
+        st.caption(
+            "システムでシフトを生成するのが初めての月など、前月分のデータが無い場合に使われます。"
+            "実際にこの社員が前月末に「準夜」だったなら「準夜」を、"
+            "「深夜」だったなら「深夜」を選んでください。それ以外は「指定なし」のままで構いません。"
+        )
+        initial_status = st.selectbox("前月末の勤務", ["指定なし", "準夜", "深夜"])
+
         submitted = st.form_submit_button("社員を追加")
         if submitted:
             if name.strip() == "":
                 st.error("名前を入力してください。")
             else:
-                add_employee(name, employment_type, gender, experience_years, group_name, can_leader, max_consecutive_days)
+                new_employee_id = add_employee(
+                    name, employment_type, gender, experience_years, group_name, can_leader, max_consecutive_days
+                )
+                save_initial_carryover_setting(
+                    new_employee_id, None if initial_status == "指定なし" else initial_status
+                )
                 st.success(f"{name}さんを登録しました。")
                 st.rerun()
 
@@ -856,12 +1085,32 @@ if menu == "社員管理":
                 key=f"max_{employee['id']}",
             )
 
+            st.write("開始前（前月末）の勤務状態")
+            st.caption(
+                "前月分のシフトがシステムでまだ生成されていない場合に使われます。"
+                "この社員の実際の前月末の勤務に合わせて設定してください。"
+            )
+            current_initial_status = get_initial_carryover_setting(employee["id"])
+            initial_status_options = ["指定なし", "準夜", "深夜"]
+            initial_status_index = (
+                initial_status_options.index(current_initial_status)
+                if current_initial_status in ["準夜", "深夜"]
+                else 0
+            )
+            edit_initial_status = st.selectbox(
+                "前月末の勤務", initial_status_options, index=initial_status_index,
+                key=f"initial_status_{employee['id']}",
+            )
+
             col1, col2 = st.columns(2)
             with col1:
                 if st.button("更新", key=f"update_{employee['id']}"):
                     update_employee(
                         employee["id"], edit_name, edit_employment, edit_gender,
                         edit_experience, edit_group, edit_leader, edit_max_consecutive,
+                    )
+                    save_initial_carryover_setting(
+                        employee["id"], None if edit_initial_status == "指定なし" else edit_initial_status
                     )
                     st.success("更新しました。")
                     st.rerun()
@@ -1021,7 +1270,6 @@ elif menu == "個人勤務条件":
 
                     # 保存後に画面を更新
                     st.rerun()
-                    
 # ============================================================
 # 希望入力
 # ============================================================
@@ -1192,6 +1440,21 @@ elif menu == "シフト生成":
         with col2:
             selected_month = st.number_input("生成する月", min_value=1, max_value=12, value=9, key="generate_month")
 
+        prev_year, prev_month = get_previous_month(selected_year, selected_month)
+        if has_month_shift_data(prev_year, prev_month):
+            st.info(
+                f"{prev_year}年{prev_month}月のシフトが生成済みのため、"
+                f"月末が準夜／深夜の社員は、{selected_month}月1日にその続き"
+                f"（深夜／公休）が自動的に確定します。"
+            )
+        else:
+            st.info(
+                f"{prev_year}年{prev_month}月のシフトはまだ生成されていません。"
+                f"社員管理画面で「開始前（前月末）の勤務状態」を設定している社員は、"
+                f"その設定に基づいて{selected_month}月1日の勤務が自動的に確定します。"
+                f"未設定の社員は、{selected_month}月1日に深夜を割り当てることはできません。"
+            )
+
         if st.button("シフトを自動生成", type="primary"):
             problems = check_generation_conditions(employees, selected_year, selected_month)
 
@@ -1253,3 +1516,62 @@ elif menu == "シフト生成":
                         file_name=f"shift_{selected_year}_{selected_month}.xlsx",
                         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                     )
+
+# ============================================================
+# データのバックアップ
+# ============================================================
+elif menu == "データのバックアップ":
+    st.header("データのバックアップ")
+
+    st.warning(
+        "Streamlit Community Cloud などGitHub連携でデプロイしている環境では、"
+        "コードを変更して再デプロイするたびに、サーバー上のファイル"
+        "（社員情報・希望・条件・生成済みシフトなどが入ったデータベースファイル）は"
+        "リセットされてしまいます。\n\n"
+        "コードを変更する前に、必ず下の「データをダウンロード」でバックアップを取り、"
+        "再デプロイ後に「データを復元」でアップロードし直してください。"
+    )
+
+    st.subheader("データをダウンロード")
+    st.write("現在のデータベースファイルをダウンロードします。コードを変更・再デプロイする前に必ず取得してください。")
+
+    if os.path.exists(DATABASE_NAME):
+        with open(DATABASE_NAME, "rb") as db_file:
+            db_bytes = db_file.read()
+        st.download_button(
+            "データをダウンロード（.db）",
+            data=db_bytes,
+            file_name="shift_system_backup.db",
+            mime="application/octet-stream",
+        )
+    else:
+        st.info("まだデータがありません。")
+
+    st.divider()
+
+    st.subheader("データを復元")
+    st.write("以前ダウンロードした .db ファイルをアップロードすると、現在のデータを上書きして復元します。")
+
+    uploaded_file = st.file_uploader("バックアップファイル（.db）を選択", type=["db"])
+    if uploaded_file is not None:
+        st.error(
+            "現在のデータはすべて、アップロードしたファイルの内容で上書きされます。"
+            "この操作は取り消せません。"
+        )
+        if st.button("この内容で復元する（上書きされます）", type="primary"):
+            with open(DATABASE_NAME, "wb") as db_file:
+                db_file.write(uploaded_file.getbuffer())
+            st.success("データを復元しました。ページを再読み込みします。")
+            st.rerun()
+
+    st.divider()
+    st.subheader("恒久的にデータを消さないようにするには")
+    st.write(
+        "手動でのバックアップ／復元が面倒な場合は、次のような方法で"
+        "再デプロイの影響を受けない場所にデータを置くことができます。\n\n"
+        "- 自前のサーバーやDockerでこのアプリを動かし、"
+        "データベースファイルを永続ボリュームに置く"
+        "（環境変数 `SHIFT_DB_PATH` にそのパスを設定すると、このアプリはそこを使います）\n"
+        "- Supabase・Neon・Turso などの外部データベースサービスを別途用意し、"
+        "そちらにデータを保存するよう改修する"
+    )
