@@ -898,7 +898,7 @@ def generate_shift(employees, year, month):
         limits = get_shift_limits(employee["id"])
         limit_dictionary = {limit["shift_type"]: (limit["min_count"], limit["max_count"]) for limit in limits}
 
-        shift_code = {"日勤": DAY, "リーダー": LEADER, "半日": HALF, "準夜": EVENING}
+        shift_code = {"日勤": DAY, "リーダー": LEADER, "半日": HALF, "準夜": EVENING, "公休": OFF}
         for shift_name, code in shift_code.items():
             if shift_name not in limit_dictionary:
                 continue
@@ -1234,7 +1234,19 @@ elif menu == "個人勤務条件":
         limits = get_shift_limits(employee["id"])
         limit_dictionary = {limit["shift_type"]: (limit["min_count"], limit["max_count"]) for limit in limits}
 
-        shift_limit_types = ["日勤", "リーダー", "半日", "準夜"]
+        # ★修正: 「公休」を追加（休みの上限を設定できるように）
+        shift_limit_types = ["日勤", "リーダー", "半日", "準夜", "公休"]
+
+        # ★追加: 現在保存されている設定を一覧表示
+        st.subheader("現在の設定")
+        current_rows = []
+        for shift_type in shift_limit_types:
+            minimum, maximum = limit_dictionary.get(shift_type, (0, 31))
+            current_rows.append({"勤務種類": shift_type, "最低回数": minimum, "最大回数（上限）": maximum})
+        st.dataframe(pd.DataFrame(current_rows), use_container_width=True, hide_index=True)
+
+        st.divider()
+        st.subheader("設定を変更")
 
         with st.form("shift_limits_form"):
             values = {}
@@ -1267,6 +1279,7 @@ elif menu == "個人勤務条件":
                         minimum, maximum = value
                         save_shift_limit(employee["id"], shift_type, minimum, maximum)
                     st.success("勤務条件を保存しました。")
+                    st.rerun()
 
 # ============================================================
 # 希望入力
