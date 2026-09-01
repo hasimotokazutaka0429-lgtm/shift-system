@@ -876,24 +876,6 @@ def generate_shift(employees, year, month):
                 model.AddImplication(shifts[e, d, NIGHT], shifts[e, d + 1, OFF])
 
     # ========================================================
-    # 有休は希望がある場合のみ許可
-    # ========================================================
-    for e, employee in enumerate(employees):
-      requests = get_requests(employee["id"], year, month)
-
-      # 有休希望の日を取得
-      paid_request_days = {
-        request["day"] - 1
-        for request in requests
-        if request["request_type"] == "有休"
-    }
-
-      for d in range(days_in_month):
-        # 有休希望がない日は、有休を禁止
-        if d not in paid_request_days:
-            model.Add(shifts[e, d, PAID] == 0)
-
-    # ========================================================
     # 希望条件
     # ========================================================
     for e, employee in enumerate(employees):
@@ -1048,6 +1030,73 @@ def generate_shift(employees, year, month):
                         + shifts[i, d, EVENING] + shifts[i, d, NIGHT]
                     )
                 model.Add(sum(for_employee) >= required_count).OnlyEnforceIf(indicator)
+
+    # ========================================================
+    # 公平性（勤務の偏りをできるだけ小さくする）
+    #
+    # 「条件を満たすシフト」は複数存在しうるため、その中でも
+    # 社員間の負担差が小さいものを選ぶよう、最適化の目的関数として設定する。
+    #   ・総勤務日数（休み以外の日数）の最大差
+    #   ・準夜／深夜勤務の回数の最大差（負担の大きい勤務のため重めに評価）
+    #   ・リーダー回数の最大差
+    # をそれぞれ最小化する（重み付き合計を最小化）。
+    # ========================================================
+    if employee_count > 1:
+        work_codes_for_fairness = [DAY, LEADER, HALF, EVENING, NIGHT]
+
+        total_work_vars = []
+        night_duty_vars = []
+        leader_duty_vars = []
+
+        for e in range(employee_count):
+            total_work_var = model.NewIntVar(0, days_in_month, f"total_work_{e}")
+            model.Add(
+                total_work_var == sum(
+                    shifts[e, d, code] for d in range(days_in_month) for code in work_codes_for_fairness
+                )
+            )
+            total_work_vars.append(total_work_var)
+
+            night_duty_var = model.NewIntVar(0, days_in_month, f"night_duty_{e}")
+            model.Add(
+                night_duty_var == sum(
+                    shifts[e, d, EVENING] + shifts[e, d, NIGHT] for d in range(days_in_month)
+                )
+            )
+            night_duty_vars.append(night_duty_var)
+
+            # リーダー可能な社員は常にリーダー回数0固定なので、
+            # リーダー可能な社員同士でのみ公平性を比較する
+            if employees[e]["can_leader"] == 1:
+                leader_duty_var = model.NewIntVar(0, days_in_month, f"leader_duty_{e}")
+                model.Add(
+                    leader_duty_var == sum(shifts[e, d, LEADER] for d in range(days_in_month))
+                )
+                leader_duty_vars.append(leader_duty_var)
+
+        max_work = model.NewIntVar(0, days_in_month, "max_total_work")
+        min_work = model.NewIntVar(0, days_in_month, "min_total_work")
+        model.AddMaxEquality(max_work, total_work_vars)
+        model.AddMinEquality(min_work, total_work_vars)
+
+        max_night = model.NewIntVar(0, days_in_month, "max_night_duty")
+        min_night = model.NewIntVar(0, days_in_month, "min_night_duty")
+        model.AddMaxEquality(max_night, night_duty_vars)
+        model.AddMinEquality(min_night, night_duty_vars)
+
+        fairness_terms = [
+            10 * (max_work - min_work),
+            5 * (max_night - min_night),
+        ]
+
+        if len(leader_duty_vars) > 1:
+            max_leader = model.NewIntVar(0, days_in_month, "max_leader_duty")
+            min_leader = model.NewIntVar(0, days_in_month, "min_leader_duty")
+            model.AddMaxEquality(max_leader, leader_duty_vars)
+            model.AddMinEquality(min_leader, leader_duty_vars)
+            fairness_terms.append(3 * (max_leader - min_leader))
+
+        model.Minimize(sum(fairness_terms))
 
     # ========================================================
     # 求解
@@ -1333,7 +1382,7 @@ elif menu == "希望休・希望勤務":
 
         dataframe = pd.DataFrame(rows)
 
-        st.write("記号：無 指定なし / 公 公休 / 有 有休 / ー 日勤 / R リーダー / 半 半日 / △ 準夜 / 〇 深夜")
+        st.write("記号：― 指定なし / 公 公休 / 有 有休 / 日 日勤 / L リーダー / 半 半日 / 準 準夜 / 深 深夜")
 
         column_config = {"社員名": st.column_config.TextColumn("社員名", disabled=True, width="medium")}
         for column in dataframe.columns[1:]:
