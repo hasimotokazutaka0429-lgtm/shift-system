@@ -47,14 +47,14 @@ SHIFT_NAMES = {
 }
 
 SHIFT_SHORT_NAMES = {
-    "指定なし": "無",
+    "指定なし": "―",
     "公休": "公",
     "有休": "有",
-    "日勤": "ー",
-    "リーダー": "R",
+    "日勤": "日",
+    "リーダー": "L",
     "半日": "半",
-    "準夜": "△",
-    "深夜": "〇",
+    "準夜": "準",
+    "深夜": "深",
 }
 
 REQUEST_OPTIONS = ["指定なし", "公休", "有休", "日勤", "リーダー", "半日", "準夜", "深夜"]
@@ -874,6 +874,18 @@ def generate_shift(employees, year, month):
             # 深夜の翌日は公休（月内のみ。月末の深夜は翌月の生成時に公休が確定する）
             if d + 1 < days_in_month:
                 model.AddImplication(shifts[e, d, NIGHT], shifts[e, d + 1, OFF])
+
+    # ========================================================
+    # 有休は本人の希望がある日にしか割り当てない（構造上のハード制約）
+    # ========================================================
+    for e, employee in enumerate(employees):
+        requests = get_requests(employee["id"], year, month)
+        paid_request_days = {
+            request["day"] - 1 for request in requests if request["request_type"] == "有休"
+        }
+        for d in range(days_in_month):
+            if d not in paid_request_days:
+                model.Add(shifts[e, d, PAID] == 0)
 
     # ========================================================
     # 希望条件
