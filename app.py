@@ -1,29 +1,36 @@
 import streamlit as st
-import sqlite3
 import calendar
-import os
-import shutil
 from datetime import date
 from io import BytesIO
 import pandas as pd
 import holidays
 from ortools.sat.python import cp_model
 
+from database import (
+    get_employees,
+    add_employee,
+    update_employee,
+    delete_employee,
+    get_requests,
+    save_request,
+    delete_request,
+    get_shift_limits,
+    save_shift_limit,
+    get_staffing_conditions,
+    save_staffing_condition,
+    get_experience_conditions,
+    save_experience_condition,
+    save_generated_shifts,
+    get_initial_carryover_setting,
+    save_initial_carryover_setting,
+    has_month_shift_data,
+    get_last_day_shift,
+)
+
 # ============================================================
 # 基本設定
 # ============================================================
 st.set_page_config(page_title="シフト生成システム", layout="wide")
-
-# ------------------------------------------------------------
-# DBファイルの場所。
-# 環境変数 SHIFT_DB_PATH が設定されていれば、そちらを使う
-# （自前サーバーやDockerで永続ボリュームをマウントしている場合に指定する）。
-# 未設定の場合はアプリと同じ場所の shift_system.db を使う
-# （Streamlit Community Cloud等、リポジトリからデプロイする環境では
-#   再デプロイのたびに消えるため、下の「データのバックアップ」メニューから
-#   こまめにバックアップ/復元してください）。
-# ------------------------------------------------------------
-DATABASE_NAME = os.environ.get("SHIFT_DB_PATH", "shift_system.db")
 
 # ============================================================
 # 勤務コード
@@ -47,14 +54,14 @@ SHIFT_NAMES = {
 }
 
 SHIFT_SHORT_NAMES = {
-    "指定なし": "無",
+    "指定なし": "―",
     "公休": "公",
     "有休": "有",
-    "日勤": "ー",
-    "リーダー": "R",
+    "日勤": "日",
+    "リーダー": "L",
     "半日": "半",
-    "準夜": "△",
-    "深夜": "〇",
+    "準夜": "準",
+    "深夜": "深",
 }
 
 REQUEST_OPTIONS = ["指定なし", "公休", "有休", "日勤", "リーダー", "半日", "準夜", "深夜"]
@@ -73,311 +80,52 @@ REQUEST_CODE_MAP = {
 # ============================================================
 # データベース接続
 # ============================================================
-def get_connection():
-    connection = sqlite3.connect(DATABASE_NAME, check_same_thread=False)
-    connection.row_factory = sqlite3.Row
-    return connection
 
 
 # ============================================================
 # データベース初期化
 # ============================================================
-def init_database():
-    connection = get_connection()
-    cursor = connection.cursor()
-
-    cursor.execute(
-        """
-        CREATE TABLE IF NOT EXISTS employees (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT NOT NULL,
-            employment_type TEXT,
-            gender TEXT,
-            experience_years INTEGER DEFAULT 0,
-            group_name TEXT DEFAULT '指定なし',
-            can_leader INTEGER DEFAULT 0,
-            max_consecutive_days INTEGER DEFAULT 5
-        )
-        """
-    )
-
-    cursor.execute(
-        """
-        CREATE TABLE IF NOT EXISTS employee_shift_limits (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            employee_id INTEGER,
-            shift_type TEXT,
-            min_count INTEGER DEFAULT 0,
-            max_count INTEGER DEFAULT 31,
-            UNIQUE(employee_id, shift_type)
-        )
-        """
-    )
-
-    cursor.execute(
-        """
-        CREATE TABLE IF NOT EXISTS requests (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            employee_id INTEGER,
-            year INTEGER,
-            month INTEGER,
-            day INTEGER,
-            request_type TEXT,
-            UNIQUE(employee_id, year, month, day)
-        )
-        """
-    )
-
-    cursor.execute(
-        """
-        CREATE TABLE IF NOT EXISTS staffing_conditions (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            condition_type TEXT,
-            group_name TEXT,
-            shift_type TEXT,
-            required_count INTEGER DEFAULT 0,
-            max_count INTEGER DEFAULT NULL,
-            UNIQUE(condition_type, group_name, shift_type)
-        )
-        """
-    )
-    # 既存DB向けの簡易マイグレーション（max_countカラムが無い場合のみ追加する）
-    try:
-        cursor.execute("ALTER TABLE staffing_conditions ADD COLUMN max_count INTEGER DEFAULT NULL")
-    except sqlite3.OperationalError:
-        pass
-
-    cursor.execute(
-        """
-        CREATE TABLE IF NOT EXISTS experience_conditions (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            condition_type TEXT,
-            group_name TEXT,
-            min_experience INTEGER,
-            required_count INTEGER DEFAULT 0,
-            UNIQUE(condition_type, group_name, min_experience)
-        )
-        """
-    )
-
-    # --------------------------------------------------------
-    # 生成済みシフト（月またぎで準夜→深夜の継続を判定するために保存する）
-    # --------------------------------------------------------
-    cursor.execute(
-        """
-        CREATE TABLE IF NOT EXISTS generated_shifts (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            employee_id INTEGER,
-            year INTEGER,
-            month INTEGER,
-            day INTEGER,
-            shift_type TEXT,
-            UNIQUE(employee_id, year, month, day)
-        )
-        """
-    )
-
-    # --------------------------------------------------------
-    # 開始前（前月末）の勤務状態
-    #
-    # システムで初めてシフトを生成する月や、前月分を生成していない月では
-    # generated_shifts に前月末のデータがない。その場合に使う、
-    # 社員ごとの手動設定（「準夜」なら1日目は深夜が確定、
-    # 「深夜」なら1日目は公休が確定）。
-    # --------------------------------------------------------
-    cursor.execute(
-        """
-        CREATE TABLE IF NOT EXISTS initial_carryover_settings (
-            employee_id INTEGER PRIMARY KEY,
-            last_shift_type TEXT
-        )
-        """
-    )
-
-    connection.commit()
-    connection.close()
 
 
 # ============================================================
 # 社員取得・追加・更新・削除
 # ============================================================
-def get_employees():
-    connection = get_connection()
-    cursor = connection.cursor()
-    cursor.execute("SELECT * FROM employees ORDER BY id")
-    employees = cursor.fetchall()
-    connection.close()
-    return employees
 
 
-def add_employee(name, employment_type, gender, experience_years, group_name, can_leader, max_consecutive_days):
-    connection = get_connection()
-    cursor = connection.cursor()
-    cursor.execute(
-        """
-        INSERT INTO employees
-            (name, employment_type, gender, experience_years, group_name, can_leader, max_consecutive_days)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-        """,
-        (name, employment_type, gender, experience_years, group_name, int(can_leader), max_consecutive_days),
-    )
-    new_employee_id = cursor.lastrowid
-    connection.commit()
-    connection.close()
-    return new_employee_id
 
 
-def update_employee(employee_id, name, employment_type, gender, experience_years, group_name, can_leader, max_consecutive_days):
-    connection = get_connection()
-    cursor = connection.cursor()
-    cursor.execute(
-        """
-        UPDATE employees
-        SET name = ?, employment_type = ?, gender = ?, experience_years = ?,
-            group_name = ?, can_leader = ?, max_consecutive_days = ?
-        WHERE id = ?
-        """,
-        (name, employment_type, gender, experience_years, group_name, int(can_leader), max_consecutive_days, employee_id),
-    )
-    connection.commit()
-    connection.close()
 
 
-def delete_employee(employee_id):
-    connection = get_connection()
-    cursor = connection.cursor()
-    cursor.execute("DELETE FROM employee_shift_limits WHERE employee_id = ?", (employee_id,))
-    cursor.execute("DELETE FROM requests WHERE employee_id = ?", (employee_id,))
-    cursor.execute("DELETE FROM initial_carryover_settings WHERE employee_id = ?", (employee_id,))
-    cursor.execute("DELETE FROM employees WHERE id = ?", (employee_id,))
-    connection.commit()
-    connection.close()
 
 
 # ============================================================
 # 希望
 # ============================================================
-def get_requests(employee_id, year, month):
-    connection = get_connection()
-    cursor = connection.cursor()
-    cursor.execute(
-        "SELECT * FROM requests WHERE employee_id = ? AND year = ? AND month = ? ORDER BY day",
-        (employee_id, year, month),
-    )
-    requests = cursor.fetchall()
-    connection.close()
-    return requests
 
 
-def save_request(employee_id, year, month, day, request_type):
-    connection = get_connection()
-    cursor = connection.cursor()
-    cursor.execute(
-        """
-        INSERT INTO requests (employee_id, year, month, day, request_type)
-        VALUES (?, ?, ?, ?, ?)
-        ON CONFLICT(employee_id, year, month, day)
-        DO UPDATE SET request_type = excluded.request_type
-        """,
-        (employee_id, year, month, day, request_type),
-    )
-    connection.commit()
-    connection.close()
 
 
-def delete_request(employee_id, year, month, day):
-    connection = get_connection()
-    cursor = connection.cursor()
-    cursor.execute(
-        "DELETE FROM requests WHERE employee_id = ? AND year = ? AND month = ? AND day = ?",
-        (employee_id, year, month, day),
-    )
-    connection.commit()
-    connection.close()
 
 
 # ============================================================
 # 個人勤務条件
 # ============================================================
-def get_shift_limits(employee_id):
-    connection = get_connection()
-    cursor = connection.cursor()
-    cursor.execute("SELECT * FROM employee_shift_limits WHERE employee_id = ?", (employee_id,))
-    limits = cursor.fetchall()
-    connection.close()
-    return limits
 
 
-def save_shift_limit(employee_id, shift_type, min_count, max_count):
-    connection = get_connection()
-    cursor = connection.cursor()
-    cursor.execute(
-        """
-        INSERT INTO employee_shift_limits (employee_id, shift_type, min_count, max_count)
-        VALUES (?, ?, ?, ?)
-        ON CONFLICT(employee_id, shift_type)
-        DO UPDATE SET min_count = excluded.min_count, max_count = excluded.max_count
-        """,
-        (employee_id, shift_type, min_count, max_count),
-    )
-    connection.commit()
-    connection.close()
 
 
 # ============================================================
 # 人数条件
 # ============================================================
-def get_staffing_conditions():
-    connection = get_connection()
-    cursor = connection.cursor()
-    cursor.execute("SELECT * FROM staffing_conditions")
-    conditions = cursor.fetchall()
-    connection.close()
-    return conditions
 
 
-def save_staffing_condition(condition_type, group_name, shift_type, required_count, max_count=None):
-    connection = get_connection()
-    cursor = connection.cursor()
-    cursor.execute(
-        """
-        INSERT INTO staffing_conditions (condition_type, group_name, shift_type, required_count, max_count)
-        VALUES (?, ?, ?, ?, ?)
-        ON CONFLICT(condition_type, group_name, shift_type)
-        DO UPDATE SET required_count = excluded.required_count, max_count = excluded.max_count
-        """,
-        (condition_type, group_name, shift_type, required_count, max_count),
-    )
-    connection.commit()
-    connection.close()
 
 
 # ============================================================
 # 経験年数条件
 # ============================================================
-def get_experience_conditions():
-    connection = get_connection()
-    cursor = connection.cursor()
-    cursor.execute("SELECT * FROM experience_conditions ORDER BY min_experience")
-    conditions = cursor.fetchall()
-    connection.close()
-    return conditions
 
 
-def save_experience_condition(condition_type, group_name, min_experience, required_count):
-    connection = get_connection()
-    cursor = connection.cursor()
-    cursor.execute(
-        """
-        INSERT INTO experience_conditions (condition_type, group_name, min_experience, required_count)
-        VALUES (?, ?, ?, ?)
-        ON CONFLICT(condition_type, group_name, min_experience)
-        DO UPDATE SET required_count = excluded.required_count
-        """,
-        (condition_type, group_name, min_experience, required_count),
-    )
-    connection.commit()
-    connection.close()
 
 
 # ============================================================
@@ -408,18 +156,6 @@ def create_condition_dictionary():
     return result
 
 
-def create_condition_max_dictionary():
-    """人数条件の上限値の辞書。上限が設定されていない組み合わせはキーに含まれない"""
-    conditions = get_staffing_conditions()
-    result = {}
-    for condition in conditions:
-        if condition["max_count"] is None:
-            continue
-        key = (condition["condition_type"], condition["group_name"], condition["shift_type"])
-        result[key] = condition["max_count"]
-    return result
-
-
 def create_experience_dictionary():
     conditions = get_experience_conditions()
     result = {}
@@ -438,30 +174,6 @@ def get_group_employee_indexes(employees, group_name):
 # ============================================================
 # 生成済みシフトの保存・取得（月またぎの準夜→深夜継続に使用）
 # ============================================================
-def save_generated_shifts(employees, year, month, result, days_in_month):
-    connection = get_connection()
-    cursor = connection.cursor()
-    cursor.execute(
-        "DELETE FROM generated_shifts WHERE year = ? AND month = ?",
-        (year, month),
-    )
-    for employee in employees:
-        name = employee["name"]
-        if name not in result:
-            continue
-        for day_index, shift_name in enumerate(result[name]):
-            if day_index >= days_in_month:
-                break
-            day = day_index + 1
-            cursor.execute(
-                """
-                INSERT INTO generated_shifts (employee_id, year, month, day, shift_type)
-                VALUES (?, ?, ?, ?, ?)
-                """,
-                (employee["id"], year, month, day, shift_name),
-            )
-    connection.commit()
-    connection.close()
 
 
 def get_previous_month(year, month):
@@ -471,120 +183,14 @@ def get_previous_month(year, month):
 
 
 # ============================================================
-# 生成済みシフトの削除
-# ============================================================
-def delete_generated_shifts_for_month(year, month):
-    """指定した年月の生成済みシフトのみを削除する"""
-    connection = get_connection()
-    cursor = connection.cursor()
-    cursor.execute(
-        "DELETE FROM generated_shifts WHERE year = ? AND month = ?",
-        (year, month),
-    )
-    deleted_count = cursor.rowcount
-    connection.commit()
-    connection.close()
-    return deleted_count
-
-
-def delete_generated_shifts_from_month(year, month):
-    """指定した年月「以降」の生成済みシフトをすべて削除する"""
-    connection = get_connection()
-    cursor = connection.cursor()
-    cursor.execute(
-        """
-        DELETE FROM generated_shifts
-        WHERE (year > ?) OR (year = ? AND month >= ?)
-        """,
-        (year, year, month),
-    )
-    deleted_count = cursor.rowcount
-    connection.commit()
-    connection.close()
-    return deleted_count
-
-
-def delete_all_generated_shifts():
-    """生成済みシフトをすべて削除する"""
-    connection = get_connection()
-    cursor = connection.cursor()
-    cursor.execute("DELETE FROM generated_shifts")
-    deleted_count = cursor.rowcount
-    connection.commit()
-    connection.close()
-    return deleted_count
-
-
-def get_generated_shift_months():
-    """生成済みシフトが存在する年月の一覧を、古い順に返す"""
-    connection = get_connection()
-    cursor = connection.cursor()
-    cursor.execute(
-        "SELECT DISTINCT year, month FROM generated_shifts ORDER BY year, month"
-    )
-    rows = cursor.fetchall()
-    connection.close()
-    return [(row["year"], row["month"]) for row in rows]
-
-
-# ============================================================
 # 開始前（前月末）の勤務状態（前月データがない場合に使う手動設定）
 # ============================================================
-def get_initial_carryover_setting(employee_id):
-    connection = get_connection()
-    cursor = connection.cursor()
-    cursor.execute(
-        "SELECT last_shift_type FROM initial_carryover_settings WHERE employee_id = ?",
-        (employee_id,),
-    )
-    row = cursor.fetchone()
-    connection.close()
-    return row["last_shift_type"] if row else None
 
 
-def save_initial_carryover_setting(employee_id, last_shift_type):
-    """last_shift_type は '準夜' / '深夜' / None（指定なし）のいずれか"""
-    connection = get_connection()
-    cursor = connection.cursor()
-    cursor.execute(
-        """
-        INSERT INTO initial_carryover_settings (employee_id, last_shift_type)
-        VALUES (?, ?)
-        ON CONFLICT(employee_id) DO UPDATE SET last_shift_type = excluded.last_shift_type
-        """,
-        (employee_id, last_shift_type),
-    )
-    connection.commit()
-    connection.close()
 
 
-def has_month_shift_data(year, month):
-    connection = get_connection()
-    cursor = connection.cursor()
-    cursor.execute(
-        "SELECT COUNT(*) AS count FROM generated_shifts WHERE year = ? AND month = ?",
-        (year, month),
-    )
-    row = cursor.fetchone()
-    connection.close()
-    return row["count"] > 0
 
 
-def get_last_day_shift(employee_id, year, month):
-    """指定した年月の、社員の最終日の確定シフトを取得する（無ければNone）"""
-    connection = get_connection()
-    cursor = connection.cursor()
-    days_in_month = calendar.monthrange(year, month)[1]
-    cursor.execute(
-        """
-        SELECT shift_type FROM generated_shifts
-        WHERE employee_id = ? AND year = ? AND month = ? AND day = ?
-        """,
-        (employee_id, year, month, days_in_month),
-    )
-    row = cursor.fetchone()
-    connection.close()
-    return row["shift_type"] if row else None
 
 
 def get_carryover_map(employees, year, month):
@@ -621,7 +227,6 @@ def check_generation_conditions(employees, year, month):
     problems = []
     days_in_month = calendar.monthrange(year, month)[1]
     conditions = create_condition_dictionary()
-    max_conditions = create_condition_max_dictionary()
     experience_conditions = create_experience_dictionary()
 
     if len(employees) == 0:
@@ -639,17 +244,6 @@ def check_generation_conditions(employees, year, month):
                 problems.append(
                     f"{employee['name']}さんの{limit['shift_type']}について、"
                     f"最低回数が最大回数を超えています。"
-                )
-
-    # ★追加: リーダー人数の上限に関する矛盾チェック（曜日タイプごとに1回）
-    for day_type in ["通常", "水曜", "土曜", "日祝"]:
-        for group_name in ["A", "B", "全体"]:
-            required_leader = conditions.get((day_type, group_name, "リーダー"), 0)
-            max_leader = max_conditions.get((day_type, group_name, "リーダー"))
-            if max_leader is not None and required_leader > max_leader:
-                problems.append(
-                    f"{day_type}のグループ{group_name}で、"
-                    f"リーダーの最低必要人数（{required_leader}人）が上限（{max_leader}人）を超えています。"
                 )
 
     for day in range(1, days_in_month + 1):
@@ -876,18 +470,6 @@ def generate_shift(employees, year, month):
                 model.AddImplication(shifts[e, d, NIGHT], shifts[e, d + 1, OFF])
 
     # ========================================================
-    # 有休は本人の希望がある日にしか割り当てない（構造上のハード制約）
-    # ========================================================
-    for e, employee in enumerate(employees):
-        requests = get_requests(employee["id"], year, month)
-        paid_request_days = {
-            request["day"] - 1 for request in requests if request["request_type"] == "有休"
-        }
-        for d in range(days_in_month):
-            if d not in paid_request_days:
-                model.Add(shifts[e, d, PAID] == 0)
-
-    # ========================================================
     # 希望条件
     # ========================================================
     for e, employee in enumerate(employees):
@@ -910,7 +492,7 @@ def generate_shift(employees, year, month):
         limits = get_shift_limits(employee["id"])
         limit_dictionary = {limit["shift_type"]: (limit["min_count"], limit["max_count"]) for limit in limits}
 
-        shift_code = {"日勤": DAY, "リーダー": LEADER, "半日": HALF, "準夜": EVENING, "公休": OFF}
+        shift_code = {"日勤": DAY, "リーダー": LEADER, "半日": HALF, "準夜": EVENING}
         for shift_name, code in shift_code.items():
             if shift_name not in limit_dictionary:
                 continue
@@ -949,7 +531,6 @@ def generate_shift(employees, year, month):
     # 人数条件
     # ========================================================
     conditions = create_condition_dictionary()
-    max_conditions = create_condition_max_dictionary()
     for d in range(days_in_month):
         day_number = d + 1
         condition_type = get_day_type(year, month, day_number)
@@ -973,16 +554,6 @@ def generate_shift(employees, year, month):
                 )
                 model.Add(
                     sum(shifts[i, d, LEADER] for i in group_employees) >= required_leader
-                ).OnlyEnforceIf(indicator)
-
-            # ★追加: リーダー人数の上限
-            max_leader = max_conditions.get((condition_type, group_name, "リーダー"))
-            if max_leader is not None:
-                indicator = add_assumption(
-                    f"{day_number}日（{condition_type}）のグループ{group_name}のリーダー人数の上限（{max_leader}人以下）"
-                )
-                model.Add(
-                    sum(shifts[i, d, LEADER] for i in group_employees) <= max_leader
                 ).OnlyEnforceIf(indicator)
 
             required_half = conditions.get((condition_type, group_name, "半日"), 0)
@@ -1042,73 +613,6 @@ def generate_shift(employees, year, month):
                         + shifts[i, d, EVENING] + shifts[i, d, NIGHT]
                     )
                 model.Add(sum(for_employee) >= required_count).OnlyEnforceIf(indicator)
-
-    # ========================================================
-    # 公平性（勤務の偏りをできるだけ小さくする）
-    #
-    # 「条件を満たすシフト」は複数存在しうるため、その中でも
-    # 社員間の負担差が小さいものを選ぶよう、最適化の目的関数として設定する。
-    #   ・総勤務日数（休み以外の日数）の最大差
-    #   ・準夜／深夜勤務の回数の最大差（負担の大きい勤務のため重めに評価）
-    #   ・リーダー回数の最大差
-    # をそれぞれ最小化する（重み付き合計を最小化）。
-    # ========================================================
-    if employee_count > 1:
-        work_codes_for_fairness = [DAY, LEADER, HALF, EVENING, NIGHT]
-
-        total_work_vars = []
-        night_duty_vars = []
-        leader_duty_vars = []
-
-        for e in range(employee_count):
-            total_work_var = model.NewIntVar(0, days_in_month, f"total_work_{e}")
-            model.Add(
-                total_work_var == sum(
-                    shifts[e, d, code] for d in range(days_in_month) for code in work_codes_for_fairness
-                )
-            )
-            total_work_vars.append(total_work_var)
-
-            night_duty_var = model.NewIntVar(0, days_in_month, f"night_duty_{e}")
-            model.Add(
-                night_duty_var == sum(
-                    shifts[e, d, EVENING] + shifts[e, d, NIGHT] for d in range(days_in_month)
-                )
-            )
-            night_duty_vars.append(night_duty_var)
-
-            # リーダー可能な社員は常にリーダー回数0固定なので、
-            # リーダー可能な社員同士でのみ公平性を比較する
-            if employees[e]["can_leader"] == 1:
-                leader_duty_var = model.NewIntVar(0, days_in_month, f"leader_duty_{e}")
-                model.Add(
-                    leader_duty_var == sum(shifts[e, d, LEADER] for d in range(days_in_month))
-                )
-                leader_duty_vars.append(leader_duty_var)
-
-        max_work = model.NewIntVar(0, days_in_month, "max_total_work")
-        min_work = model.NewIntVar(0, days_in_month, "min_total_work")
-        model.AddMaxEquality(max_work, total_work_vars)
-        model.AddMinEquality(min_work, total_work_vars)
-
-        max_night = model.NewIntVar(0, days_in_month, "max_night_duty")
-        min_night = model.NewIntVar(0, days_in_month, "min_night_duty")
-        model.AddMaxEquality(max_night, night_duty_vars)
-        model.AddMinEquality(min_night, night_duty_vars)
-
-        fairness_terms = [
-            10 * (max_work - min_work),
-            5 * (max_night - min_night),
-        ]
-
-        if len(leader_duty_vars) > 1:
-            max_leader = model.NewIntVar(0, days_in_month, "max_leader_duty")
-            min_leader = model.NewIntVar(0, days_in_month, "min_leader_duty")
-            model.AddMaxEquality(max_leader, leader_duty_vars)
-            model.AddMinEquality(min_leader, leader_duty_vars)
-            fairness_terms.append(3 * (max_leader - min_leader))
-
-        model.Minimize(sum(fairness_terms))
 
     # ========================================================
     # 求解
@@ -1171,11 +675,6 @@ def create_excel(result, year, month):
 
 
 # ============================================================
-# DB初期化
-# ============================================================
-init_database()
-
-# ============================================================
 # タイトル
 # ============================================================
 st.title("シフト自動生成システム")
@@ -1185,7 +684,7 @@ st.title("シフト自動生成システム")
 # ============================================================
 menu = st.sidebar.radio(
     "メニュー",
-    ["社員管理", "個人勤務条件", "希望休・希望勤務", "人数条件", "シフト生成", "データのバックアップ"],
+    ["社員管理", "個人勤務条件", "希望休・希望勤務", "人数条件", "シフト生成"],
 )
 
 # ============================================================
@@ -1303,63 +802,150 @@ elif menu == "個人勤務条件":
     st.header("個人ごとの勤務回数条件")
 
     employees = get_employees()
+
     if len(employees) == 0:
         st.info("先に社員を登録してください。")
+
     else:
-        employee_names = {employee["name"]: employee for employee in employees}
-        selected_name = st.selectbox("社員", list(employee_names.keys()))
+        employee_names = {
+            employee["name"]: employee
+            for employee in employees
+        }
+
+        selected_name = st.selectbox(
+            "社員",
+            list(employee_names.keys())
+        )
+
         employee = employee_names[selected_name]
 
+        # ----------------------------------------------------
+        # 保存されている勤務条件を取得
+        # ----------------------------------------------------
         limits = get_shift_limits(employee["id"])
-        limit_dictionary = {limit["shift_type"]: (limit["min_count"], limit["max_count"]) for limit in limits}
 
-        # ★修正: 「公休」を追加（休みの上限を設定できるように）
-        shift_limit_types = ["日勤", "リーダー", "半日", "準夜", "公休"]
+        limit_dictionary = {
+            limit["shift_type"]: (
+                limit["min_count"],
+                limit["max_count"]
+            )
+            for limit in limits
+        }
 
-        # ★追加: 現在保存されている設定を一覧表示
-        st.subheader("現在の設定")
-        current_rows = []
+        shift_limit_types = [
+            "日勤",
+            "リーダー",
+            "半日",
+            "準夜"
+        ]
+
+        # ====================================================
+        # 現在保存されている条件を表示
+        # ====================================================
+        st.subheader("現在の勤務条件")
+
+        condition_rows = []
+
         for shift_type in shift_limit_types:
-            minimum, maximum = limit_dictionary.get(shift_type, (0, 31))
-            current_rows.append({"勤務種類": shift_type, "最低回数": minimum, "最大回数（上限）": maximum})
-        st.dataframe(pd.DataFrame(current_rows), use_container_width=True, hide_index=True)
+            minimum, maximum = limit_dictionary.get(
+                shift_type,
+                (0, 31)
+            )
+
+            condition_rows.append({
+                "勤務種類": shift_type,
+                "最低回数": minimum,
+                "最大回数": maximum
+            })
+
+        condition_dataframe = pd.DataFrame(condition_rows)
+
+        st.dataframe(
+            condition_dataframe,
+            use_container_width=True,
+            hide_index=True
+        )
 
         st.divider()
-        st.subheader("設定を変更")
+
+        # ====================================================
+        # 条件編集
+        # ====================================================
+        st.subheader("勤務条件を変更")
 
         with st.form("shift_limits_form"):
+
             values = {}
+
             for shift_type in shift_limit_types:
-                current = limit_dictionary.get(shift_type, (0, 31))
+
+                current = limit_dictionary.get(
+                    shift_type,
+                    (0, 31)
+                )
+
                 col1, col2 = st.columns(2)
+
                 with col1:
                     minimum = st.number_input(
-                        f"{shift_type} 最低回数", min_value=0, max_value=31, value=current[0],
+                        f"{shift_type} 最低回数",
+                        min_value=0,
+                        max_value=31,
+                        value=int(current[0]),
                         key=f"min_{employee['id']}_{shift_type}",
                     )
+
                 with col2:
                     maximum = st.number_input(
-                        f"{shift_type} 最大回数", min_value=0, max_value=31, value=current[1],
+                        f"{shift_type} 最大回数",
+                        min_value=0,
+                        max_value=31,
+                        value=int(current[1]),
                         key=f"max_{employee['id']}_{shift_type}",
                     )
-                values[shift_type] = (minimum, maximum)
+
+                values[shift_type] = (
+                    minimum,
+                    maximum
+                )
 
             submitted = st.form_submit_button("保存")
+
             if submitted:
+
                 has_error = False
+
                 for shift_type, value in values.items():
+
                     minimum, maximum = value
+
                     if minimum > maximum:
-                        st.error(f"{shift_type}の最低回数が最大回数を超えています。")
+
+                        st.error(
+                            f"{shift_type}の最低回数が最大回数を超えています。"
+                        )
+
                         has_error = True
 
                 if not has_error:
-                    for shift_type, value in values.items():
-                        minimum, maximum = value
-                        save_shift_limit(employee["id"], shift_type, minimum, maximum)
-                    st.success("勤務条件を保存しました。")
-                    st.rerun()
 
+                    for shift_type, value in values.items():
+
+                        minimum, maximum = value
+
+                        save_shift_limit(
+                            employee["id"],
+                            shift_type,
+                            minimum,
+                            maximum
+                        )
+
+                    st.success(
+                        "勤務条件を保存しました。"
+                    )
+
+                    # 保存後に画面を更新
+                    st.rerun()
 # ============================================================
 # 希望入力
 # ============================================================
@@ -1394,7 +980,7 @@ elif menu == "希望休・希望勤務":
 
         dataframe = pd.DataFrame(rows)
 
-        st.write("記号：無 指定なし / 公 公休 / 有 有休 / ー 日勤 / R リーダー / 半 半日 / △ 準夜 / 〇 深夜")
+        st.write("記号：― 指定なし / 公 公休 / 有 有休 / 日 日勤 / L リーダー / 半 半日 / 準 準夜 / 深 深夜")
 
         column_config = {"社員名": st.column_config.TextColumn("社員名", disabled=True, width="medium")}
         for column in dataframe.columns[1:]:
@@ -1441,7 +1027,6 @@ elif menu == "人数条件":
     # 通常の人数条件
     # ========================================================
     st.subheader("勤務人数条件")
-    existing_max_conditions = create_condition_max_dictionary()
     for condition_type in condition_types:
         with st.expander(f"{condition_type}の条件", expanded=False):
             for group_name in groups:
@@ -1457,32 +1042,9 @@ elif menu == "人数条件":
                             key=f"{condition_type}_{group_name}_{shift_type}",
                         )
 
-                # ★追加: リーダー人数の上限（1日あたり）
-                leader_key = (condition_type, group_name, "リーダー")
-                existing_leader_max = existing_max_conditions.get(leader_key)
-                leader_max_col1, leader_max_col2 = st.columns([1, 2])
-                with leader_max_col1:
-                    leader_max_enabled = st.checkbox(
-                        "リーダー人数の上限を設定する",
-                        value=existing_leader_max is not None,
-                        key=f"leader_max_enabled_{condition_type}_{group_name}",
-                    )
-                with leader_max_col2:
-                    leader_max_value = st.number_input(
-                        "1日あたりのリーダー上限人数",
-                        min_value=0, max_value=100,
-                        value=existing_leader_max if existing_leader_max is not None else max(1, values["リーダー"]),
-                        key=f"leader_max_value_{condition_type}_{group_name}",
-                        disabled=not leader_max_enabled,
-                    )
-
                 if st.button(f"{condition_type} グループ{group_name} 保存", key=f"save_{condition_type}_{group_name}"):
-                    leader_max_to_save = leader_max_value if leader_max_enabled else None
                     for shift_type, value in values.items():
-                        if shift_type == "リーダー":
-                            save_staffing_condition(condition_type, group_name, shift_type, value, leader_max_to_save)
-                        else:
-                            save_staffing_condition(condition_type, group_name, shift_type, value)
+                        save_staffing_condition(condition_type, group_name, shift_type, value)
                     st.success("保存しました。")
 
     # ========================================================
@@ -1619,177 +1181,14 @@ elif menu == "シフト生成":
                         weekday = calendar.weekday(selected_year, selected_month, day)
                         columns.append(f"{day}({weekday_names[weekday]})")
 
-                    # ★修正: 結果表示はSHIFT_SHORT_NAMESの短縮表記で行う
-                    # （generated_shifts等に保存されている result 自体はフルネームのまま変更しない）
-                    display_result = {
-                        name: [SHIFT_SHORT_NAMES.get(shift, shift) for shift in shift_list]
-                        for name, shift_list in result.items()
-                    }
-
-                    st.write("記号：公 公休 / 有 有休 / 日 日勤 / L リーダー / 半 半日 / 準 準夜 / 深 深夜")
-
-                    dataframe = pd.DataFrame(display_result).T
+                    dataframe = pd.DataFrame(result).T
                     dataframe.columns = columns
                     st.dataframe(dataframe, use_container_width=True)
 
-                    excel_data = create_excel(display_result, selected_year, selected_month)
+                    excel_data = create_excel(result, selected_year, selected_month)
                     st.download_button(
                         "Excelをダウンロード",
                         data=excel_data,
                         file_name=f"shift_{selected_year}_{selected_month}.xlsx",
                         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                     )
-
-# ============================================================
-# データのバックアップ
-# ============================================================
-elif menu == "データのバックアップ":
-    st.header("データのバックアップ")
-
-    st.warning(
-        "Streamlit Community Cloud などGitHub連携でデプロイしている環境では、"
-        "コードを変更して再デプロイするたびに、サーバー上のファイル"
-        "（社員情報・希望・条件・生成済みシフトなどが入ったデータベースファイル）は"
-        "リセットされてしまいます。\n\n"
-        "コードを変更する前に、必ず下の「データをダウンロード」でバックアップを取り、"
-        "再デプロイ後に「データを復元」でアップロードし直してください。"
-    )
-
-    st.subheader("データをダウンロード")
-    st.write("現在のデータベースファイルをダウンロードします。コードを変更・再デプロイする前に必ず取得してください。")
-
-    if os.path.exists(DATABASE_NAME):
-        with open(DATABASE_NAME, "rb") as db_file:
-            db_bytes = db_file.read()
-        st.download_button(
-            "データをダウンロード（.db）",
-            data=db_bytes,
-            file_name="shift_system_backup.db",
-            mime="application/octet-stream",
-        )
-    else:
-        st.info("まだデータがありません。")
-
-    st.divider()
-
-    st.subheader("データを復元")
-    st.write("以前ダウンロードした .db ファイルをアップロードすると、現在のデータを上書きして復元します。")
-
-    uploaded_file = st.file_uploader("バックアップファイル（.db）を選択", type=["db"])
-    if uploaded_file is not None:
-        st.error(
-            "現在のデータはすべて、アップロードしたファイルの内容で上書きされます。"
-            "この操作は取り消せません。"
-        )
-        if st.button("この内容で復元する（上書きされます）", type="primary"):
-            with open(DATABASE_NAME, "wb") as db_file:
-                db_file.write(uploaded_file.getbuffer())
-            st.success("データを復元しました。ページを再読み込みします。")
-            st.rerun()
-
-    st.divider()
-    st.subheader("恒久的にデータを消さないようにするには")
-    st.write(
-        "手動でのバックアップ／復元が面倒な場合は、次のような方法で"
-        "再デプロイの影響を受けない場所にデータを置くことができます。\n\n"
-        "- 自前のサーバーやDockerでこのアプリを動かし、"
-        "データベースファイルを永続ボリュームに置く"
-        "（環境変数 `SHIFT_DB_PATH` にそのパスを設定すると、このアプリはそこを使います）\n"
-        "- Supabase・Neon・Turso などの外部データベースサービスを別途用意し、"
-        "そちらにデータを保存するよう改修する"
-    )
-
-    st.divider()
-    st.subheader("生成済みシフトの削除")
-    st.write(
-        "生成済みシフトを削除します。社員情報・希望・各種条件は削除されません。\n\n"
-        "生成済みシフトは、月またぎの準夜→深夜の継続判定にも使われています。"
-        "削除すると、その月について「前月データなし」として扱われるようになる"
-        "（＝社員管理で設定した「開始前の勤務状態」、または継続なしの扱いに戻る）点にご注意ください。"
-    )
-
-    existing_months = get_generated_shift_months()
-    if existing_months:
-        month_labels = [f"{year}年{month}月" for year, month in existing_months]
-        st.caption("生成済みシフトがある年月：" + " / ".join(month_labels))
-    else:
-        st.info("現在、生成済みシフトはありません。")
-
-    col1, col2 = st.columns(2)
-    with col1:
-        delete_target_year = st.number_input(
-            "対象年", min_value=2020, max_value=2100, value=2026, key="delete_shift_year"
-        )
-    with col2:
-        delete_target_month = st.number_input(
-            "対象月", min_value=1, max_value=12, value=9, key="delete_shift_month"
-        )
-
-    st.write("① 指定した月のシフトを削除")
-    if st.button(
-        f"{delete_target_year}年{delete_target_month}月のシフトを削除する",
-        key="delete_month_button",
-    ):
-        st.session_state["confirm_delete_month"] = True
-    if st.session_state.get("confirm_delete_month"):
-        st.warning(
-            f"{delete_target_year}年{delete_target_month}月の生成済みシフトを削除します。"
-            f"この操作は取り消せません。"
-        )
-        confirm_col1, confirm_col2 = st.columns(2)
-        with confirm_col1:
-            if st.button("削除を実行する", key="confirm_delete_month_button", type="primary"):
-                deleted_count = delete_generated_shifts_for_month(delete_target_year, delete_target_month)
-                st.session_state["confirm_delete_month"] = False
-                st.success(f"{delete_target_year}年{delete_target_month}月のシフト（{deleted_count}件）を削除しました。")
-                st.rerun()
-        with confirm_col2:
-            if st.button("キャンセル", key="cancel_delete_month_button"):
-                st.session_state["confirm_delete_month"] = False
-                st.rerun()
-
-    st.divider()
-
-    st.write("② 指定した月以降のシフトをまとめて削除")
-    if st.button(
-        f"{delete_target_year}年{delete_target_month}月以降のシフトを削除する",
-        key="delete_from_month_button",
-    ):
-        st.session_state["confirm_delete_from_month"] = True
-    if st.session_state.get("confirm_delete_from_month"):
-        st.warning(
-            f"{delete_target_year}年{delete_target_month}月、およびそれ以降に生成された"
-            f"シフトをすべて削除します。この操作は取り消せません。"
-        )
-        confirm_col1, confirm_col2 = st.columns(2)
-        with confirm_col1:
-            if st.button("削除を実行する", key="confirm_delete_from_month_button", type="primary"):
-                deleted_count = delete_generated_shifts_from_month(delete_target_year, delete_target_month)
-                st.session_state["confirm_delete_from_month"] = False
-                st.success(
-                    f"{delete_target_year}年{delete_target_month}月以降のシフト（{deleted_count}件）を削除しました。"
-                )
-                st.rerun()
-        with confirm_col2:
-            if st.button("キャンセル", key="cancel_delete_from_month_button"):
-                st.session_state["confirm_delete_from_month"] = False
-                st.rerun()
-
-    st.divider()
-
-    st.write("③ すべての生成済みシフトを削除")
-    if st.button("すべての生成済みシフトを削除する", key="delete_all_button"):
-        st.session_state["confirm_delete_all"] = True
-    if st.session_state.get("confirm_delete_all"):
-        st.warning("生成済みのシフトを全期間分削除します。この操作は取り消せません。")
-        confirm_col1, confirm_col2 = st.columns(2)
-        with confirm_col1:
-            if st.button("削除を実行する", key="confirm_delete_all_button", type="primary"):
-                deleted_count = delete_all_generated_shifts()
-                st.session_state["confirm_delete_all"] = False
-                st.success(f"すべての生成済みシフト（{deleted_count}件）を削除しました。")
-                st.rerun()
-        with confirm_col2:
-            if st.button("キャンセル", key="cancel_delete_all_button"):
-                st.session_state["confirm_delete_all"] = False
-                st.rerun()
