@@ -12,10 +12,10 @@ SUPABASE_KEY = os.environ.get("sb_publishable_5rCCiy44SCzNy9O_GooSYA_g2Q3BQn1")
 
 # ローカルのStreamlitでは .streamlit/secrets.toml から取得できるようにする。
 if not SUPABASE_URL:
-    SUPABASE_URL = st.secrets.get("SUPABASE_URL")
+    SUPABASE_URL = st.secrets.get("https://aikmcawgwfrvcactbtxu.supabase.co")
 
 if not SUPABASE_KEY:
-    SUPABASE_KEY = st.secrets.get("SUPABASE_KEY")
+    SUPABASE_KEY = st.secrets.get("sb_publishable_5rCCiy44SCzNy9O_GooSYA_g2Q3BQn1")
 
 if not SUPABASE_URL:
     raise RuntimeError("SUPABASE_URL が設定されていません。")
